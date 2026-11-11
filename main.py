@@ -1,11 +1,24 @@
 #!/usr/bin/env python3
-"""Deterministic, model-free geolocation from coarse JPEG colour statistics."""
-import json, math, os, struct, urllib.request
+"""Place street photos using coarse colour cues and broad regional priors.
+
+The entry decodes JPEG DC coefficients into an approximate block-colour grid,
+extracts climate and vegetation features, and ranks aggregated regional
+profiles. It combines the top two matches with one world-centroid vote, then
+uses a deterministic spherical geometric median for the final coordinate.
+"""
+
+import json
+import math
+import os
+import struct
+import urllib.request
+
 
 CENTROID = (22.17, 10.51)
 FEATURES = ['bluesky','skyBlue','skySat','midB','B','midGreen','midG','gray','gndB','yellow','white','gndG','gndR','gndRed','lrgrad','Ysd']
 MEAN_STD = [(0.314,.255),(53.074,46.266),(54.184,45.14),(128.298,43.44),(129.422,27.526),(16.863,20.781),(124.34,33.521),(.156,.136),(93.788,44.216),(.004,.015),(.074,.1),(99.676,47.782),(94.938,48.582),(-4.738,14.744),(1.372,32.331),(58.526,12.834)]
-# (latitude, longitude, feature profile)
+
+# Each row is latitude, longitude, and the aggregate feature profile.
 ANCHORS = [
 (-37.68,-67.81,[.31,60.51,60.51,149.63,155.65,38.48,143.59,.19,141.57,.01,.09,170,175.13,5.14,-7.96,40.65]),
 (-44.16,169.86,[.33,64.94,64.94,76.29,102.62,11.35,76.13,.11,74.25,0,.06,76.8,69.52,-7.28,-23.52,70.25]),
@@ -26,156 +39,393 @@ ANCHORS = [
 (67.01,22.46,[.5,63.45,64.56,122.55,122.61,17.42,110.24,.09,77.71,0,.05,79.25,64.71,-14.55,14.59,54.48]),
 ]
 
-class Bits:
-    def __init__(self, data, pos): self.data=data; self.pos=pos; self.buf=0; self.n=0
-    def get(self, n):
-        while self.n < n:
-            if self.pos >= len(self.data): b=255
-            else:
-                b=self.data[self.pos]; self.pos+=1
-                if b==255:
-                    if self.pos<len(self.data) and self.data[self.pos]==0: self.pos+=1
-                    else: b=255
-            self.buf=(self.buf<<8)|b; self.n+=8
-        self.n-=n; v=(self.buf>>self.n)&((1<<n)-1); self.buf &= (1<<self.n)-1 if self.n else 0
-        return v
 
-def huffman(counts, symbols):
-    table={}; code=0; idx=0
-    for length,count in enumerate(counts,1):
-        for _ in range(count): table[(length,code)]=symbols[idx]; idx+=1; code+=1
+class BitReader:
+    """Read JPEG entropy-coded bits, skipping byte-stuffing after 0xFF."""
+
+    def __init__(self, data, position):
+        self.data = data
+        self.position = position
+        self.buffer = 0
+        self.available = 0
+
+    def read(self, count):
+        while self.available < count:
+            if self.position >= len(self.data):
+                byte = 255
+            else:
+                byte = self.data[self.position]
+                self.position += 1
+                if byte == 255:
+                    if self.position < len(self.data) and self.data[self.position] == 0:
+                        self.position += 1
+                    else:
+                        byte = 255
+            self.buffer = (self.buffer << 8) | byte
+            self.available += 8
+        self.available -= count
+        value = (self.buffer >> self.available) & ((1 << count) - 1)
+        self.buffer &= (1 << self.available) - 1 if self.available else 0
+        return value
+
+
+def build_huffman_table(counts, symbols):
+    table = {}
+    code = 0
+    index = 0
+    for length, count in enumerate(counts, 1):
+        for _ in range(count):
+            table[(length, code)] = symbols[index]
+            index += 1
+            code += 1
         code <<= 1
     return table
 
-def hdecode(bits, table):
-    code=0
-    for length in range(1,17):
-        code=(code<<1)|bits.get(1)
-        if (length,code) in table: return table[(length,code)]
+
+def decode_huffman_symbol(reader, table):
+    code = 0
+    for length in range(1, 17):
+        code = (code << 1) | reader.read(1)
+        if (length, code) in table:
+            return table[(length, code)]
     raise ValueError('invalid Huffman code')
 
-def extend(bits,n):
-    if not n: return 0
-    v=bits.get(n); return v-(1<<n)+1 if v < (1<<(n-1)) else v
 
-def jpeg_rgb(data):
-    if data[:2]!=b'\xff\xd8': raise ValueError('not JPEG')
-    q={}; dc={}; ac={}; comps=[]; i=2; scan=None
-    while i<len(data)-1:
-        if data[i]!=255: i+=1; continue
-        m=data[i+1]
-        if m in (0xd8,0xd9) or 0xd0<=m<=0xd7: i+=2; continue
-        ln=int.from_bytes(data[i+2:i+4],'big'); seg=data[i+4:i+2+ln]
-        if m==0xdb:
-            j=0
-            while j<len(seg):
-                spec=seg[j]; j+=1; tq=spec&15
-                if spec>>4: q[tq]=[int.from_bytes(seg[j+2*k:j+2*k+2],'big') for k in range(64)]; j+=128
-                else: q[tq]=list(seg[j:j+64]); j+=64
-        elif m==0xc0:
-            height,width=struct.unpack('>HH',seg[1:5]); nc=seg[5]
-            for k in range(nc):
-                hv=seg[7+3*k]; comps.append((seg[6+3*k],hv>>4,hv&15,seg[8+3*k]))
-        elif m==0xc4:
-            j=0
-            while j<len(seg):
-                spec=seg[j]; j+=1; counts=list(seg[j:j+16]); j+=16; syms=list(seg[j:j+sum(counts)]); j+=sum(counts)
-                (dc if spec>>4==0 else ac)[spec&15]=huffman(counts,syms)
-        elif m==0xda:
-            ns=seg[0]; scan=[]
-            for k in range(ns):
-                cs=seg[1+2*k]; sel=seg[2+2*k]; scan.append((cs,sel>>4,sel&15))
-            start=i+2+ln; break
-        i+=2+ln
-    else: raise ValueError('missing scan')
-    hm=max(c[1] for c in comps); vm=max(c[2] for c in comps); mx=(width+8*hm-1)//(8*hm); my=(height+8*vm-1)//(8*vm)
-    grids=[[[0]*(mx*c[1]) for _ in range(my*c[2])] for c in comps]; indices={c[0]:k for k,c in enumerate(comps)}
-    bits=Bits(data,start); prev=[0]*len(comps)
-    for y in range(my):
-        for x in range(mx):
-            for cid,td,ta in scan:
-                ci=indices[cid]; c=comps[ci]
-                for by in range(c[2]):
-                    for bx in range(c[1]):
-                        prev[ci]+=extend(bits,hdecode(bits,dc[td])); grids[ci][y*c[2]+by][x*c[1]+bx]=prev[ci]*q[c[3]][0]
-                        k=0
-                        while k<63:
-                            sym=hdecode(bits,ac[ta])
-                            if sym==0: break
-                            run,size=sym>>4,sym&15
-                            if size: bits.get(size)
-                            k+=16 if sym==240 else run+1
-    rows=my*vm; cols=mx*hm; out=[]
-    for r in range(rows):
-        row=[]
-        for col in range(cols):
-            vals=[]
-            for ci in range(min(3,len(comps))):
-                g=grids[ci]; rr=min(r*len(g)//rows,len(g)-1); cc=min(col*len(g[0])//cols,len(g[0])-1)
-                vals.append(g[rr][cc]/8+128)
-            yy=vals[0]; cb=vals[1]-128 if len(vals)>1 else 0; cr=vals[2]-128 if len(vals)>2 else 0
-            row.append((max(0,min(255,yy+1.402*cr)),max(0,min(255,yy-.34414*cb-.71414*cr)),max(0,min(255,yy+1.772*cb))))
-        out.append(row)
-    return out
+def receive_extended(reader, count):
+    if not count:
+        return 0
+    value = reader.read(count)
+    return value - (1 << count) + 1 if value < (1 << (count - 1)) else value
 
-def features(rgb):
-    nr=len(rgb); nc=len(rgb[0]); cells=[v for row in rgb for v in row]
-    def mean(part): return tuple(sum(p[k] for p in part)/len(part) for k in range(3))
-    def band(a,b): return mean([p for row in rgb[int(nr*a):max(int(nr*b),int(nr*a)+1)] for p in row])
-    sky=band(0,.18); mid=band(.30,.65); gnd=band(.72,1)
-    blue=green=white=gray=yellow=0
-    for r,g,b in cells:
-        blue+=b>r+20 and b>g+8; green+=g>r+8 and g>b+5
-        white+=r>195 and g>195 and b>195 and max(r,g,b)-min(r,g,b)<25
-        gray+=max(r,g,b)-min(r,g,b)<14 and 50<(r+g+b)/3<175
-        yellow+=r>140 and g>105 and b<110 and r-b>50
-    ys=[.299*r+.587*g+.114*b for r,g,b in cells]; ym=sum(ys)/len(ys)
-    sy=math.sqrt(sum((v-ym)**2 for v in ys)/len(ys))
-    top=[.299*r+.587*g+.114*b for row in rgb[:nr//3] for r,g,b in row]
-    bot=[.299*r+.587*g+.114*b for row in rgb[2*nr//3:] for r,g,b in row]
-    left=[.299*r+.587*g+.114*b for row in rgb for r,g,b in row[:nc//2]]; right=[.299*r+.587*g+.114*b for row in rgb for r,g,b in row[nc//2:]]
-    return [blue/len(cells),sky[2]-sky[0],max(sky)-min(sky),mid[2],sum(p[2] for p in cells)/len(cells),mid[1]-mid[0],mid[1],gray/len(cells),gnd[2],yellow/len(cells),white/len(cells),gnd[1],gnd[0],gnd[0]-gnd[1],sum(left)/len(left)-sum(right)/len(right),sy]
 
-def distance(a,b):
-    p1,p2=math.radians(a[0]),math.radians(b[0]); dl=math.radians(b[1]-a[1]); dp=p2-p1
-    x=math.sin(dp/2)**2+math.cos(p1)*math.cos(p2)*math.sin(dl/2)**2
-    return 12742*math.asin(min(1,math.sqrt(x)))
+def parse_jpeg_headers(data):
+    """Return JPEG quantization, Huffman, frame, and scan metadata."""
+    if data[:2] != b'\xff\xd8':
+        raise ValueError('not JPEG')
+    quantization = {}
+    dc_tables = {}
+    ac_tables = {}
+    components = []
+    position = 2
 
-def median(points):
-    lat=sum(p[0] for p in points)/len(points); lon=sum(p[1] for p in points)/len(points)
+    while position < len(data) - 1:
+        if data[position] != 255:
+            position += 1
+            continue
+        marker = data[position + 1]
+        if marker in (0xd8, 0xd9) or 0xd0 <= marker <= 0xd7:
+            position += 2
+            continue
+        length = int.from_bytes(data[position + 2:position + 4], 'big')
+        segment = data[position + 4:position + 2 + length]
+
+        if marker == 0xdb:
+            offset = 0
+            while offset < len(segment):
+                spec = segment[offset]
+                offset += 1
+                table_id = spec & 15
+                if spec >> 4:
+                    quantization[table_id] = [
+                        int.from_bytes(segment[offset + 2 * k:offset + 2 * k + 2], 'big')
+                        for k in range(64)
+                    ]
+                    offset += 128
+                else:
+                    quantization[table_id] = list(segment[offset:offset + 64])
+                    offset += 64
+        elif marker == 0xc0:
+            height, width = struct.unpack('>HH', segment[1:5])
+            component_count = segment[5]
+            for k in range(component_count):
+                sampling = segment[7 + 3 * k]
+                components.append((
+                    segment[6 + 3 * k],
+                    sampling >> 4,
+                    sampling & 15,
+                    segment[8 + 3 * k],
+                ))
+        elif marker == 0xc4:
+            offset = 0
+            while offset < len(segment):
+                spec = segment[offset]
+                offset += 1
+                counts = list(segment[offset:offset + 16])
+                offset += 16
+                symbols = list(segment[offset:offset + sum(counts)])
+                offset += sum(counts)
+                target = dc_tables if spec >> 4 == 0 else ac_tables
+                target[spec & 15] = build_huffman_table(counts, symbols)
+        elif marker == 0xda:
+            scan_count = segment[0]
+            scan = []
+            for k in range(scan_count):
+                component_id = segment[1 + 2 * k]
+                selectors = segment[2 + 2 * k]
+                scan.append((component_id, selectors >> 4, selectors & 15))
+            return (width, height, components, quantization, dc_tables,
+                    ac_tables, scan, position + 2 + length)
+        position += 2 + length
+    raise ValueError('missing scan')
+
+
+def decode_dc_blocks(data):
+    """Decode baseline JPEG DC values, skipping AC coefficients safely."""
+    (width, height, components, quantization, dc_tables, ac_tables,
+     scan, scan_start) = parse_jpeg_headers(data)
+    max_h = max(component[1] for component in components)
+    max_v = max(component[2] for component in components)
+    mcu_cols = (width + 8 * max_h - 1) // (8 * max_h)
+    mcu_rows = (height + 8 * max_v - 1) // (8 * max_v)
+    grids = [
+        [[0] * (mcu_cols * component[1]) for _ in range(mcu_rows * component[2])]
+        for component in components
+    ]
+    component_indices = {component[0]: i for i, component in enumerate(components)}
+    reader = BitReader(data, scan_start)
+    previous_dc = [0] * len(components)
+
+    for mcu_y in range(mcu_rows):
+        for mcu_x in range(mcu_cols):
+            for component_id, dc_selector, ac_selector in scan:
+                component_index = component_indices[component_id]
+                component = components[component_index]
+                for block_y in range(component[2]):
+                    for block_x in range(component[1]):
+                        category = decode_huffman_symbol(reader, dc_tables[dc_selector])
+                        previous_dc[component_index] += receive_extended(reader, category)
+                        grids[component_index][mcu_y * component[2] + block_y][
+                            mcu_x * component[1] + block_x
+                        ] = previous_dc[component_index] * quantization[component[3]][0]
+
+                        coefficient = 0
+                        while coefficient < 63:
+                            symbol = decode_huffman_symbol(reader, ac_tables[ac_selector])
+                            if symbol == 0:
+                                break
+                            run, size = symbol >> 4, symbol & 15
+                            if size:
+                                reader.read(size)
+                            coefficient += 16 if symbol == 240 else run + 1
+
+    return width, height, components, grids
+
+
+def dc_blocks_to_rgb(width, height, components, grids):
+    """Upsample component DC grids and convert their means to approximate RGB."""
+    max_h = max(component[1] for component in components)
+    max_v = max(component[2] for component in components)
+    mcu_cols = (width + 8 * max_h - 1) // (8 * max_h)
+    mcu_rows = (height + 8 * max_v - 1) // (8 * max_v)
+    rows = mcu_rows * max_v
+    columns = mcu_cols * max_h
+    output = []
+    for row_index in range(rows):
+        row = []
+        for column_index in range(columns):
+            values = []
+            for component_index in range(min(3, len(components))):
+                grid = grids[component_index]
+                grid_row = min(row_index * len(grid) // rows, len(grid) - 1)
+                grid_column = min(column_index * len(grid[0]) // columns, len(grid[0]) - 1)
+                values.append(grid[grid_row][grid_column] / 8 + 128)
+            y_value = values[0]
+            cb = values[1] - 128 if len(values) > 1 else 0
+            cr = values[2] - 128 if len(values) > 2 else 0
+            row.append((
+                max(0, min(255, y_value + 1.402 * cr)),
+                max(0, min(255, y_value - .34414 * cb - .71414 * cr)),
+                max(0, min(255, y_value + 1.772 * cb)),
+            ))
+        output.append(row)
+    return output
+
+
+def decode_jpeg_rgb(data):
+    """Decode JPEG DC block means into a low-resolution RGB grid."""
+    width, height, components, grids = decode_dc_blocks(data)
+    return dc_blocks_to_rgb(width, height, components, grids)
+
+
+def mean_rgb(cells):
+    return tuple(sum(pixel[channel] for pixel in cells) / len(cells) for channel in range(3))
+
+
+def band_statistics(rgb_grid):
+    """Return RGB means for the sky, middle, and ground image bands."""
+    row_count = len(rgb_grid)
+
+    def band(start, end):
+        first = int(row_count * start)
+        last = max(int(row_count * end), first + 1)
+        cells = [pixel for row in rgb_grid[first:last] for pixel in row]
+        return mean_rgb(cells)
+
+    return band(0, .18), band(.30, .65), band(.72, 1)
+
+
+def colour_fractions(cells):
+    """Count blue, green, white, grey, and yellow coarse colour categories."""
+    blue = green = white = gray = yellow = 0
+    for red, green_channel, blue_channel in cells:
+        blue += blue_channel > red + 20 and blue_channel > green_channel + 8
+        green += green_channel > red + 8 and green_channel > blue_channel + 5
+        white += (
+            red > 195 and green_channel > 195 and blue_channel > 195
+            and max(red, green_channel, blue_channel) - min(red, green_channel, blue_channel) < 25
+        )
+        gray += (
+            max(red, green_channel, blue_channel) - min(red, green_channel, blue_channel) < 14
+            and 50 < (red + green_channel + blue_channel) / 3 < 175
+        )
+        yellow += (
+            red > 140 and green_channel > 105 and blue_channel < 110
+            and red - blue_channel > 50
+        )
+    count = len(cells)
+    return blue / count, green / count, white / count, gray / count, yellow / count
+
+
+def luminance_features(rgb_grid, cells):
+    """Return whole-image luminance spread and left-to-right gradient."""
+    row_count = len(rgb_grid)
+    column_count = len(rgb_grid[0])
+    luminance = [.299 * r + .587 * g + .114 * b for r, g, b in cells]
+    average = sum(luminance) / len(luminance)
+    spread = math.sqrt(sum((value - average) ** 2 for value in luminance) / len(luminance))
+
+    left = [
+        .299 * r + .587 * g + .114 * b
+        for row in rgb_grid for r, g, b in row[:column_count // 2]
+    ]
+    right = [
+        .299 * r + .587 * g + .114 * b
+        for row in rgb_grid for r, g, b in row[column_count // 2:]
+    ]
+    return sum(left) / len(left) - sum(right) / len(right), spread
+
+
+def extract_features(rgb_grid):
+    """Extract the fixed ordered feature vector used by the regional priors."""
+    cells = [pixel for row in rgb_grid for pixel in row]
+    sky, middle, ground = band_statistics(rgb_grid)
+    blue, green_fraction, white, gray, yellow = colour_fractions(cells)
+    left_right_gradient, luminance_spread = luminance_features(rgb_grid, cells)
+    return [
+        blue,
+        sky[2] - sky[0],
+        max(sky) - min(sky),
+        middle[2],
+        sum(pixel[2] for pixel in cells) / len(cells),
+        middle[1] - middle[0],
+        middle[1],
+        gray,
+        ground[2],
+        yellow,
+        white,
+        ground[1],
+        ground[0],
+        ground[0] - ground[1],
+        left_right_gradient,
+        luminance_spread,
+    ]
+
+
+def score_anchor(feature_vector, profile):
+    """Return standardized squared distance between photo and anchor profiles."""
+    return sum(
+        (
+            (feature_vector[index] - MEAN_STD[index][0]) / MEAN_STD[index][1]
+            - (profile[index] - MEAN_STD[index][0]) / MEAN_STD[index][1]
+        ) ** 2
+        for index in range(len(feature_vector))
+    )
+
+
+def rank_anchors(feature_vector):
+    """Sort regional centres by their colour-profile distance to the photo."""
+    scored = [
+        (score_anchor(feature_vector, profile), (latitude, longitude))
+        for latitude, longitude, profile in ANCHORS
+    ]
+    return sorted(scored)
+
+
+def spherical_distance(point_a, point_b):
+    latitude_a, longitude_a = point_a
+    latitude_b, longitude_b = point_b
+    phi_a = math.radians(latitude_a)
+    phi_b = math.radians(latitude_b)
+    delta_latitude = math.radians(latitude_b - latitude_a)
+    delta_longitude = math.radians(longitude_b - longitude_a)
+    haversine = (
+        math.sin(delta_latitude / 2) ** 2
+        + math.cos(phi_a) * math.cos(phi_b) * math.sin(delta_longitude / 2) ** 2
+    )
+    return 12742 * math.asin(min(1, math.sqrt(haversine)))
+
+
+def spherical_geometric_median(points):
+    """Compute a deterministic Weiszfeld median over spherical distances."""
+    latitude = sum(point[0] for point in points) / len(points)
+    longitude = sum(point[1] for point in points) / len(points)
     for _ in range(50):
-        den=slat=slon=0.0
-        for p in points:
-            d=distance((lat,lon),p)
-            if d<1e-9: return p
-            w=1/d; den+=w; slat+=p[0]*w; slon+=p[1]*w
-        nlat,nlon=slat/den,slon/den
-        if abs(nlat-lat)<1e-6 and abs(nlon-lon)<1e-6: break
-        lat,lon=nlat,nlon
-    return lat,lon
+        denominator = weighted_latitude = weighted_longitude = 0.0
+        for point in points:
+            distance = spherical_distance((latitude, longitude), point)
+            if distance < 1e-9:
+                return point
+            weight = 1.0 / distance
+            denominator += weight
+            weighted_latitude += point[0] * weight
+            weighted_longitude += point[1] * weight
+        new_latitude = weighted_latitude / denominator
+        new_longitude = weighted_longitude / denominator
+        if abs(new_latitude - latitude) < 1e-6 and abs(new_longitude - longitude) < 1e-6:
+            break
+        latitude, longitude = new_latitude, new_longitude
+    return latitude, longitude
 
-def predict(data):
-    f=features(jpeg_rgb(data)); ranked=[]
-    for lat,lon,prof in ANCHORS:
-        score=sum((((f[i]-MEAN_STD[i][0])/MEAN_STD[i][1])-((prof[i]-MEAN_STD[i][0])/MEAN_STD[i][1]))**2 for i in range(len(f)))
-        ranked.append((score,(lat,lon)))
-    # The practice sweep favored two regional matches for this colour model.
-    # One centroid vote stabilizes the estimate while preserving regional signal.
-    return median([p for _,p in sorted(ranked)[:2]]+[CENTROID])
 
-def request(url, payload=None):
-    body=None if payload is None else json.dumps(payload,separators=(',',':')).encode()
-    req=urllib.request.Request(url,data=body,headers={'Content-Type':'application/json'} if body else {})
-    with urllib.request.urlopen(req,timeout=60) as response: return response.read()
+def predict_location(jpeg_bytes):
+    """Decode a photo, rank priors, and combine top-2 plus one centroid vote."""
+    features = extract_features(decode_jpeg_rgb(jpeg_bytes))
+    matches = rank_anchors(features)
+    candidates = [coordinate for _, coordinate in matches[:2]] + [CENTROID]
+    return spherical_geometric_median(candidates)
+
+
+def http_request(url, payload=None):
+    body = None if payload is None else json.dumps(payload, separators=(',', ':')).encode()
+    headers = {'Content-Type': 'application/json'} if body else {}
+    request = urllib.request.Request(url, data=body, headers=headers)
+    with urllib.request.urlopen(request, timeout=60) as response:
+        return response.read()
+
 
 def main():
-    base=os.environ['MAKEFUN_ENV_URL'].rstrip('/'); listing=json.loads(request(base+'/photos'))
-    answers=[]
-    for photo in listing['photos']:
-        try: lat,lon=predict(request(base+photo['url']))
-        except Exception: lat,lon=CENTROID
-        answers.append({'id':photo['id'],'lat':round(lat,6),'lon':round(lon,6)})
-    request(base+'/answers',{'answers':answers})
-    for a in answers: print(json.dumps({'lat':a['lat'],'lon':a['lon']}))
+    environment_url = os.environ.get('MAKEFUN_ENV_URL')
+    if not environment_url:
+        raise SystemExit('MAKEFUN_ENV_URL is required')
+    base_url = environment_url.rstrip('/')
+    photo_list = json.loads(http_request(base_url + '/photos'))
+    if not photo_list.get('photos'):
+        raise SystemExit('The environment returned no photos')
+    answers = []
+    for photo in photo_list['photos']:
+        try:
+            latitude, longitude = predict_location(http_request(base_url + photo['url']))
+        except Exception:
+            latitude, longitude = CENTROID
+        answers.append({
+            'id': photo['id'],
+            'lat': round(latitude, 6),
+            'lon': round(longitude, 6),
+        })
+    http_request(base_url + '/answers', {'answers': answers})
+    for answer in answers:
+        print(json.dumps({'lat': answer['lat'], 'lon': answer['lon']}))
 
-if __name__=='__main__': main()
+
+if __name__ == '__main__':
+    main()
