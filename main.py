@@ -159,9 +159,9 @@ def predict(data):
     for lat,lon,prof in ANCHORS:
         score=sum((((f[i]-MEAN_STD[i][0])/MEAN_STD[i][1])-((prof[i]-MEAN_STD[i][0])/MEAN_STD[i][1]))**2 for i in range(len(f)))
         ranked.append((score,(lat,lon)))
-    # Three centroid votes pushed trial 0 above the target range, so retain
-    # the two-vote stabilizer that performed better across all partitions.
-    return median([p for _,p in sorted(ranked)[:3]]+[CENTROID,CENTROID])
+    # The practice sweep favored two regional matches for this colour model.
+    # One centroid vote stabilizes the estimate while preserving regional signal.
+    return median([p for _,p in sorted(ranked)[:2]]+[CENTROID])
 
 def request(url, payload=None):
     body=None if payload is None else json.dumps(payload,separators=(',',':')).encode()
