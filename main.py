@@ -1,475 +1,157 @@
-"""photo-geolocator-01 entry: model-free geolocator (Python 3.13, stdlib only).
+#!/usr/bin/env python3
+"""Model-free photo geolocator: JPEG DC colour cues and broad regional priors."""
+import json, math, os, struct, urllib.request
 
-Places each street photo by its JPEG DC colour statistics: decodes the
-baseline-JPEG DC coefficients with pure-Python code, builds a block-level RGB
-grid, extracts colour/climate statistics, scores them against a small
-hand-built table of regional priors (broad climate/vegetation regions with a
-centre and a mean colour profile), and answers the geometric median of the
-best-matching regions plus the world centroid. No model calls, no network
-beyond the trial env, no wall clock, no randomness: fully deterministic.
+FEATS = ['bluesky','skyBlue','skySat','midB','B','midGreen','midG','gray','gndB','yellow','white','gndG','gndR','gndRed','lrgrad','Ysd']
+MEANS = [0.314,53.074,54.184,128.298,129.422,16.863,124.34,0.156,93.788,0.004,0.074,99.676,94.938,-4.738,1.372,58.526]
+SDS = [0.255,46.266,45.14,43.44,27.526,20.781,33.521,0.136,44.216,0.015,0.1,47.782,48.582,14.744,32.331,12.834]
+# Aggregated regional centres and feature profiles; each profile is a regional mean.
+ANCHORS = json.loads('''[[-37.68,-67.81,[0.31,60.51,60.51,149.63,155.65,38.48,143.59,0.19,141.57,0.01,0.09,170.0,175.13,5.14,-7.96,40.65]],[-44.16,169.86,[0.33,64.94,64.94,76.29,102.62,11.35,76.13,0.11,74.25,0.0,0.06,76.8,69.52,-7.28,-23.52,70.25]],[-25.05,-67.41,[0.27,84.85,84.85,117.98,140.4,-0.16,126.67,0.11,133.65,0.0,0.0,144.59,141.77,-2.82,8.97,41.97]],[-19.29,-45.41,[0.15,34.16,34.29,110.46,118.43,11.95,110.35,0.17,71.07,0.01,0.14,79.76,77.43,-2.33,-4.19,63.96]],[-13.48,40.34,[0.47,137.83,137.83,178.56,165.35,66.22,159.1,0.05,120.83,0.02,0.04,142.84,133.4,-9.44,-9.26,47.59]],[-15.59,147.89,[0.35,72.03,72.03,97.83,112.21,14.97,111.91,0.04,69.52,0.02,0.01,88.03,84.72,-3.31,-9.58,57.96]],[22.37,-96.98,[0.31,27.74,29.85,158.43,129.52,11.83,151.95,0.2,68.47,0.0,0.08,68.59,66.98,-1.62,-30.04,63.64]],[7.9,-6.6,[0.35,61.31,61.31,125.08,118.09,26.61,112.55,0.05,60.99,0.0,0.03,66.21,58.57,-7.64,16.27,63.47]],[8.22,34.62,[0.39,47.12,50.96,106.74,133.51,0.16,112.7,0.04,139.84,0.03,0.09,141.6,145.28,3.68,-11.76,56.71]],[15.13,87.64,[0.18,24.37,29.6,107.37,115.09,10.35,110.12,0.22,100.58,0.0,0.06,105.53,102.51,-3.02,4.26,58.82]],[50.17,-124.14,[0.34,41.03,42.54,123.82,99.52,5.01,112.88,0.11,48.24,0.0,0.02,42.72,41.09,-1.63,35.11,53.83]],[42.57,-94.31,[0.4,62.94,64.1,144.71,149.52,24.75,138.1,0.15,136.77,0.0,0.01,144.57,138.86,-5.71,13.21,47.14]],[46.19,33.4,[0.27,45.51,45.85,139.12,137.54,12.85,137.62,0.21,99.86,0.0,0.12,100.79,92.91,-7.88,8.22,64.96]],[46.8,71.19,[0.18,22.2,22.62,106.49,114.95,7.55,107.25,0.27,73.26,0.0,0.12,81.05,79.05,-2.0,3.91,63.35]],[40.47,133.83,[0.27,44.47,44.9,120.77,116.07,10.0,118.19,0.23,78.01,0.0,0.08,76.29,71.86,-4.42,-19.46,64.88]],[62.23,-136.51,[0.74,144.32,144.32,213.75,178.61,50.56,168.89,0.03,95.85,0.0,0.0,106.6,111.39,4.8,9.98,53.31]],[67.01,22.46,[0.5,63.45,64.56,122.55,122.61,17.42,110.24,0.09,77.71,0.0,0.05,79.25,64.71,-14.55,14.59,54.48]]]''')
+CENTROID=(22.17,10.51)
 
-Protocol (agent/v1): reads MAKEFUN_ENV_URL, GETs /photos, GETs each photo,
-POSTs {"answers": [{"id", "lat", "lon"}]} to /answers. Every photo is always
-answered (the world centroid is the fallback), so no photo scores the
-20,015 km unanswered penalty.
-"""
-
-import json
-import math
-import os
-import struct
-import urllib.error
-import urllib.request
-
-# ---------------------------------------------------------------- JPEG DC decoder
-# Baseline JPEG only (SOF0, Huffman). Returns dequantised DC per 8x8 block.
-# A block whose 63 AC coefficients fill exactly ends WITHOUT an EOB marker;
-# the AC loop must stop at 63 coefficients, or the next block's DC is read
-# from the wrong bit (a real desync found in a practice photo).
-
-
-class BitReader:
-    __slots__ = ("data", "pos", "bitbuf", "bitcnt")
-
-    def __init__(self, data, pos):
-        self.data = data
-        self.pos = pos
-        self.bitbuf = 0
-        self.bitcnt = 0
-
-    def _fill(self):
-        d = self.data
-        while self.bitcnt <= 24:
-            if self.pos >= len(d):
-                self.bitbuf = (self.bitbuf << 8) | 0xFF
-                self.bitcnt += 8
-                continue
-            b = d[self.pos]
-            self.pos += 1
-            if b == 0xFF:
-                if self.pos < len(d) and d[self.pos] == 0x00:
-                    self.pos += 1  # stuffed byte: skip it
-                else:
-                    self.bitbuf = (self.bitbuf << 8) | 0xFF
-                    self.bitcnt += 8
-                    continue
-            self.bitbuf = (self.bitbuf << 8) | b
-            self.bitcnt += 8
-
-    def bits(self, n):
-        if n == 0:
-            return 0
-        self._fill()
-        self.bitcnt -= n
-        v = (self.bitbuf >> self.bitcnt) & ((1 << n) - 1)
-        self.bitbuf &= (1 << self.bitcnt) - 1 if self.bitcnt else 0
-        return v
-
-    def bit(self):
-        return self.bits(1)
-
-
-class Huff:
-    __slots__ = ("counts", "symbols", "mincode", "maxcode", "valptr")
-
-    def __init__(self, counts, symbols):
-        self.counts = counts
-        self.symbols = symbols
-        self.mincode = [0] * 16
-        self.maxcode = [0] * 16
-        self.valptr = [0] * 16
-        code = 0
-        k = 0
-        for l in range(16):
-            if counts[l]:
-                self.valptr[l] = k
-                self.mincode[l] = code
-                code += counts[l]
-                self.maxcode[l] = code - 1
+class Bits:
+    def __init__(self, data, offset): self.d=data; self.p=offset; self.buf=0; self.n=0
+    def get(self, count):
+        while self.n < count:
+            if self.p >= len(self.d): b=255
             else:
-                self.maxcode[l] = -1
+                b=self.d[self.p]; self.p+=1
+                if b==255 and self.p<len(self.d):
+                    if self.d[self.p]==0: self.p+=1
+                    else: b=255
+            self.buf=(self.buf<<8)|b; self.n+=8
+        self.n-=count
+        out=(self.buf>>self.n)&((1<<count)-1)
+        self.buf &= (1<<self.n)-1 if self.n else 0
+        return out
+
+class Huffman:
+    def __init__(self, counts, symbols):
+        self.lookup={}; code=0; ix=0
+        for length, count in enumerate(counts,1):
+            for _ in range(count): self.lookup[(length,code)]=symbols[ix]; code+=1; ix+=1
             code <<= 1
-            k += counts[l]
+    def symbol(self, bits):
+        code=0
+        for n in range(1,17):
+            code=(code<<1)|bits.get(1)
+            if (n,code) in self.lookup: return self.lookup[(n,code)]
+        raise ValueError('invalid Huffman code')
 
-    def decode(self, br):
-        code = br.bit()
-        for l in range(16):
-            if code <= self.maxcode[l]:
-                idx = self.valptr[l] + (code - self.mincode[l])
-                return self.symbols[idx]
-            code = (code << 1) | br.bit()
-        raise ValueError("bad huffman code")
-
-
-def _receive_extend(br, n):
-    if n == 0:
-        return 0
-    v = br.bits(n)
-    if v < (1 << (n - 1)):
-        return v - (1 << n) + 1
-    return v
-
-
-def decode_dc(data):
-    """JPEG bytes -> (width, height, comps, grids); grids[i] is the DC grid
-    (dequantised DC per 8x8 block) of component i."""
-    if data[:2] != b"\xff\xd8":
-        raise ValueError("not a JPEG")
-    i = 2
-    qtables = {}
-    huff_dc = {}
-    huff_ac = {}
-    width = height = 0
-    comps = []
-    scan = None
-    n = len(data)
-    while i < n - 1:
-        if data[i] != 0xFF:
-            i += 1
-            continue
-        m = data[i + 1]
-        if m == 0xD8 or m == 0xD9 or 0xD0 <= m <= 0xD7:
-            i += 2
-            continue
-        ln = struct.unpack(">H", data[i + 2:i + 4])[0]
-        seg = data[i + 4:i + 2 + ln]
-        if m == 0xDB:  # DQT
-            j = 0
-            while j < len(seg):
-                pq = seg[j] >> 4
-                tq = seg[j] & 15
-                j += 1
-                if pq == 0:
-                    qtables[tq] = list(seg[j:j + 64])
-                    j += 64
-                else:
-                    qtables[tq] = [struct.unpack(">H", seg[j + 2 * k:j + 2 * k + 2])[0]
-                                   for k in range(64)]
-                    j += 128
-        elif m == 0xC0:  # SOF0
-            height, width = struct.unpack(">HH", seg[1:5])
-            nc = seg[5]
-            for k in range(nc):
-                cid = seg[6 + 3 * k]
-                hv = seg[7 + 3 * k]
-                tq = seg[8 + 3 * k]
-                comps.append({"id": cid, "h": hv >> 4, "v": hv & 15, "tq": tq})
-        elif m == 0xC4:  # DHT
-            j = 0
-            while j < len(seg):
-                tc = seg[j] >> 4
-                th = seg[j] & 15
-                j += 1
-                counts = list(seg[j:j + 16])
-                j += 16
-                total = sum(counts)
-                syms = list(seg[j:j + total])
-                j += total
-                h = Huff(counts, syms)
-                if tc == 0:
-                    huff_dc[th] = h
-                else:
-                    huff_ac[th] = h
-        elif m == 0xDA:  # SOS
-            ns = seg[0]
-            scan = []
-            for k in range(ns):
-                cs = seg[1 + 2 * k]
-                tdta = seg[2 + 2 * k]
-                scan.append((cs, tdta >> 4, tdta & 15))
-            scan_start = i + 2 + ln
-            break
-        i += 2 + ln
-    if scan is None:
-        raise ValueError("no SOS found")
-    hmax = max(c["h"] for c in comps)
-    vmax = max(c["v"] for c in comps)
-    mcux = (width + 8 * hmax - 1) // (8 * hmax)
-    mcuy = (height + 8 * vmax - 1) // (8 * vmax)
-    grids = []
-    for c in comps:
-        bw = mcux * c["h"]
-        bh = mcuy * c["v"]
-        grids.append([[0] * bw for _ in range(bh)])
-    comp_by_id = {c["id"]: (idx, c) for idx, c in enumerate(comps)}
-    br = BitReader(data, scan_start)
-    prev_dc = [0] * len(comps)
-    for my in range(mcuy):
-        for mx in range(mcux):
-            for (cs, td, ta) in scan:
-                idx, c = comp_by_id[cs]
-                q = qtables[c["tq"]][0]
-                for by in range(c["v"]):
-                    for bx in range(c["h"]):
-                        s = huff_dc[td].decode(br)
-                        diff = _receive_extend(br, s)
-                        prev_dc[idx] += diff
-                        grids[idx][my * c["v"] + by][mx * c["h"] + bx] = prev_dc[idx] * q
-                        k = 0
-                        while True:
-                            r = huff_ac[ta].decode(br)
-                            if r == 0x00:
-                                break  # EOB
-                            run = r >> 4
-                            size = r & 15
-                            if size:
-                                br.bits(size)
-                            if r == 0xF0:
-                                k += 16
+def decode_jpeg(data):
+    if data[:2]!=b'\xff\xd8': raise ValueError('not jpeg')
+    pos=2; quant={}; dc={}; ac={}; comps=[]; width=height=0
+    while pos+4<=len(data):
+        if data[pos]!=255: pos+=1; continue
+        marker=data[pos+1]
+        if marker in (0xd8,0xd9) or 0xd0<=marker<=0xd7: pos+=2; continue
+        size=int.from_bytes(data[pos+2:pos+4],'big'); seg=data[pos+4:pos+2+size]
+        if marker==0xdb:
+            j=0
+            while j<len(seg):
+                spec=seg[j]; j+=1; tid=spec&15
+                if spec>>4: quant[tid]=[int.from_bytes(seg[j+k*2:j+k*2+2],'big') for k in range(64)]; j+=128
+                else: quant[tid]=list(seg[j:j+64]); j+=64
+        elif marker==0xc0:
+            height,width=struct.unpack('>HH',seg[1:5]); n=seg[5]
+            for k in range(n):
+                ident,hv,tq=seg[6+3*k:9+3*k]; comps.append({'id':ident,'h':hv>>4,'v':hv&15,'tq':tq})
+        elif marker==0xc4:
+            j=0
+            while j<len(seg):
+                spec=seg[j]; j+=1; counts=list(seg[j:j+16]); j+=16; syms=list(seg[j:j+sum(counts)]); j+=sum(counts)
+                (dc if spec>>4==0 else ac)[spec&15]=Huffman(counts,syms)
+        elif marker==0xda:
+            n=seg[0]; scan=[]
+            for k in range(n):
+                ident,sel=seg[1+2*k:3+2*k]; scan.append((ident,sel>>4,sel&15))
+            start=pos+2+size; break
+        pos+=2+size
+    else: raise ValueError('missing scan')
+    hm=max(c['h'] for c in comps); vm=max(c['v'] for c in comps)
+    mx=(width+8*hm-1)//(8*hm); my=(height+8*vm-1)//(8*vm)
+    grids=[[[0]*(mx*c['h']) for _ in range(my*c['v'])] for c in comps]
+    indexes={c['id']:i for i,c in enumerate(comps)}; previous=[0]*len(comps); bits=Bits(data,start)
+    def extend(v,n): return v-(1<<n)+1 if n and v < (1<<(n-1)) else v
+    for y in range(my):
+        for x in range(mx):
+            for ident,dt,at in scan:
+                ci=indexes[ident]; c=comps[ci]
+                for by in range(c['v']):
+                    for bx in range(c['h']):
+                        cat=dc[dt].symbol(bits); previous[ci]+=extend(bits.get(cat),cat)
+                        grids[ci][y*c['v']+by][x*c['h']+bx]=previous[ci]*quant[c['tq']][0]
+                        k=0
+                        while k<63:
+                            code=ac[at].symbol(bits)
+                            if code==0: break
+                            run=code>>4; n=code&15
+                            if code==0xf0: k+=16
                             else:
-                                k += run + 1
-                            if k >= 63:
-                                break  # block full: no EOB follows
-    return width, height, comps, grids
-
-
-def dc_to_rgb_grid(width, height, comps, grids):
-    """(rows, cols, rgb): block-level RGB grid, chroma upsampled by nearest
-    neighbour to luma resolution. A block's mean pixel is ~DC/8 + 128."""
-    hmax = max(c["h"] for c in comps)
-    vmax = max(c["v"] for c in comps)
-    mcux = (width + 8 * hmax - 1) // (8 * hmax)
-    mcuy = (height + 8 * vmax - 1) // (8 * vmax)
-    rows = mcuy * vmax
-    cols = mcux * hmax
-    yi = 0
-    cbi = 1 if len(comps) > 1 else 0
-    cri = 2 if len(comps) > 2 else 0
-
-    def comp_val(g, r, c):
-        gh = len(g)
-        gw = len(g[0])
-        rr = min(r * gh // rows, gh - 1)
-        cc = min(c * gw // cols, gw - 1)
-        return g[rr][cc] / 8.0
-
-    yg = grids[yi]
-    cbg = grids[cbi]
-    crg = grids[cri]
-    rgb = []
+                                if n: bits.get(n)
+                                k+=run+1
+    rows=my*vm; cols=mx*hm
+    if len(comps)<3: raise ValueError('unexpected colour components')
+    rgb=[]
     for r in range(rows):
-        row = []
-        for c in range(cols):
-            y = comp_val(yg, r, c) + 128
-            cb = comp_val(cbg, r, c) + 128
-            cr = comp_val(crg, r, c) + 128
-            R = y + 1.402 * (cr - 128)
-            G = y - 0.34414 * (cb - 128) - 0.71414 * (cr - 128)
-            B = y + 1.772 * (cb - 128)
-            row.append((max(0, min(255, R)), max(0, min(255, G)), max(0, min(255, B))))
+        row=[]
+        for col in range(cols):
+            vals=[]
+            for i,g in enumerate(grids):
+                yy=min(r*len(g)//rows,len(g)-1); xx=min(col*len(g[0])//cols,len(g[0])-1)
+                vals.append(g[yy][xx]/8+128)
+            yy,cb,cr=vals[0],vals[1]-128,vals[2]-128
+            row.append((max(0,min(255,yy+1.402*cr)),max(0,min(255,yy-.34414*cb-.71414*cr)),max(0,min(255,yy+1.772*cb))) )
         rgb.append(row)
-    return rows, cols, rgb
+    return rgb
 
+def features(rgb):
+    h=len(rgb); w=len(rgb[0]); flat=[p for row in rgb for p in row]
+    def avg(a): return tuple(sum(p[i] for p in a)/len(a) for i in range(3))
+    sky=avg([p for row in rgb[:max(1,int(h*.18))] for p in row]); mid=avg([p for row in rgb[int(h*.30):max(int(h*.65),int(h*.30)+1)] for p in row]); ground=avg([p for row in rgb[int(h*.72):] for p in row])
+    lum=[.299*r+.587*g+.114*b for r,g,b in flat]; mu=sum(lum)/len(lum); ys=math.sqrt(sum((v-mu)**2 for v in lum)/len(lum))
+    green=blue=white=gray=yellow=0
+    for r,g,b in flat:
+        green+=g>r+8 and g>b+5; blue+=b>r+20 and b>g+8
+        white+=r>195 and g>195 and b>195 and max(r,g,b)-min(r,g,b)<25
+        gray+=max(r,g,b)-min(r,g,b)<14 and 50<(r+g+b)/3<175
+        yellow+=r>140 and g>105 and b<110 and r-b>50
+    top=sum(.299*r+.587*g+.114*b for row in rgb[:h//3] for r,g,b in row)/(h//3*w)
+    bot=sum(.299*r+.587*g+.114*b for row in rgb[2*h//3:] for r,g,b in row)/(h//3*w)
+    left=sum(.299*r+.587*g+.114*b for row in rgb for r,g,b in row[:w//2])/(h*(w//2))
+    right=sum(.299*r+.587*g+.114*b for row in rgb for r,g,b in row[w//2:])/(h*(w-w//2))
+    return [blue/len(flat),sky[2]-sky[0],max(sky)-min(sky),mid[2],avg(flat)[2],mid[1]-mid[0],mid[1],gray/len(flat),ground[2],yellow/len(flat),white/len(flat),ground[1],ground[0],ground[0]-ground[1],left-right,ys]
 
-# ---------------------------------------------------------------- features
-def extract(rgb):
-    """Colour/climate statistics of the block RGB grid. Only the features the
-    anchor table uses are returned, in FEATS order."""
-    rows = len(rgb)
-    cols = len(rgb[0])
-
-    def stats(cells):
-        n = len(cells)
-        return (sum(c[0] for c in cells) / n,
-                sum(c[1] for c in cells) / n,
-                sum(c[2] for c in cells) / n)
-
-    allcells = [c for row in rgb for c in row]
-    mr, mg, mb = stats(allcells)
-    ys = [0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2] for c in allcells]
-    my = sum(ys) / len(ys)
-    vy = sum((y - my) ** 2 for y in ys) / len(ys)
-    sy = math.sqrt(vy)
-
-    def band(r0, r1):
-        cells = [c for row in rgb[int(rows * r0):max(int(rows * r1), int(rows * r0) + 1)]
-                 for c in row]
-        return stats(cells)
-
-    sky = band(0.0, 0.18)
-    mid = band(0.30, 0.65)
-    gnd = band(0.72, 1.0)
-    n = len(allcells)
-    blue = white = gray = yellow = 0
-    for (R, G, B) in allcells:
-        if B > R + 20 and B > G + 8:
-            blue += 1
-        if R > 195 and G > 195 and B > 195 and max(R, G, B) - min(R, G, B) < 25:
-            white += 1
-        if max(R, G, B) - min(R, G, B) < 14 and 50 < (R + G + B) / 3 < 175:
-            gray += 1
-        if R > 140 and G > 105 and B < 110 and R - B > 50:
-            yellow += 1
-    ly = sum(0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2]
-             for row in rgb for c in row[:cols // 2]) / (rows * cols // 2)
-    ry = sum(0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2]
-             for row in rgb for c in row[cols // 2:]) / (rows * cols // 2)
-    return {
-        "bluesky": blue / n,
-        "skyBlue": sky[2] - sky[0],
-        "skySat": max(sky) - min(sky),
-        "midB": mid[2],
-        "B": mb,
-        "midGreen": mid[1] - mid[0],
-        "midG": mid[1],
-        "gray": gray / n,
-        "gndB": gnd[2],
-        "yellow": yellow / n,
-        "white": white / n,
-        "gndG": gnd[1],
-        "gndR": gnd[0],
-        "gndRed": gnd[0] - gnd[1],
-        "lrgrad": ly - ry,
-        "Ysd": sy,
-    }
-
-
-# ---------------------------------------------------------------- regional priors
-# Hand-built anchor table. Each anchor is a broad climate/vegetation region
-# (lat, lon = regional centre) with the mean colour/climate profile of street
-# photos from that region, calibrated on the kit's 75 public practice photos.
-# Aggregated regions, not individual photos or places: no photo table.
-FEATS = ["bluesky", "skyBlue", "skySat", "midB", "B", "midGreen", "midG",
-         "gray", "gndB", "yellow", "white", "gndG", "gndR", "gndRed",
-         "lrgrad", "Ysd"]
-# (mean, std) of each feature across the practice photos, for standardising.
-STD = [(0.314, 0.255), (53.074, 46.266), (54.184, 45.14), (128.298, 43.44),
-       (129.422, 27.526), (16.863, 20.781), (124.34, 33.521), (0.156, 0.136),
-       (93.788, 44.216), (0.004, 0.015), (0.074, 0.1), (99.676, 47.782),
-       (94.938, 48.582), (-4.738, 14.744), (1.372, 32.331), (58.526, 12.834)]
-# Practice photos' mean place: the stabilising prior when the signal is weak.
-CENTROID = (22.17, 10.51)
-# (lat, lon, [profile in FEATS order])
-ANCHORS = [
-    (-37.7, -67.8, [0.3, 60.5, 60.5, 149.6, 155.7, 38.5, 143.6, 0.2, 141.6, 0.0, 0.1, 170.0, 175.1, 5.1, -8.0, 40.6]),
-    (-44.2, 169.9, [0.3, 64.9, 64.9, 76.3, 102.6, 11.3, 76.1, 0.1, 74.2, 0.0, 0.1, 76.8, 69.5, -7.3, -23.5, 70.2]),
-    (-25.1, -67.4, [0.3, 84.8, 84.8, 118.0, 140.4, -0.2, 126.7, 0.1, 133.7, 0.0, 0.0, 144.6, 141.8, -2.8, 9.0, 42.0]),
-    (-19.3, -45.4, [0.1, 34.2, 34.3, 110.5, 118.4, 11.9, 110.3, 0.2, 71.1, 0.0, 0.1, 79.8, 77.4, -2.3, -4.2, 64.0]),
-    (-13.5, 40.3, [0.5, 137.8, 137.8, 178.6, 165.3, 66.2, 159.1, 0.1, 120.8, 0.0, 0.0, 142.8, 133.4, -9.4, -9.3, 47.6]),
-    (-15.6, 147.9, [0.3, 72.0, 72.0, 97.8, 112.2, 15.0, 111.9, 0.0, 69.5, 0.0, 0.0, 88.0, 84.7, -3.3, -9.6, 58.0]),
-    (22.4, -97.0, [0.3, 27.7, 29.9, 158.4, 129.5, 11.8, 151.9, 0.2, 68.5, 0.0, 0.1, 68.6, 67.0, -1.6, -30.0, 63.6]),
-    (7.9, -6.6, [0.3, 61.3, 61.3, 125.1, 118.1, 26.6, 112.5, 0.1, 61.0, 0.0, 0.0, 66.2, 58.6, -7.6, 16.3, 63.5]),
-    (8.2, 34.6, [0.4, 47.1, 51.0, 106.7, 133.5, 0.2, 112.7, 0.0, 139.8, 0.0, 0.1, 141.6, 145.3, 3.7, -11.8, 56.7]),
-    (15.1, 87.6, [0.2, 24.4, 29.6, 107.4, 115.1, 10.3, 110.1, 0.2, 100.6, 0.0, 0.1, 105.5, 102.5, -3.0, 4.3, 58.8]),
-    (50.2, -124.1, [0.3, 41.0, 42.5, 123.8, 99.5, 5.0, 112.9, 0.1, 48.2, 0.0, 0.0, 42.7, 41.1, -1.6, 35.1, 53.8]),
-    (42.6, -94.3, [0.4, 62.9, 64.1, 144.7, 149.5, 24.8, 138.1, 0.1, 136.8, 0.0, 0.0, 144.6, 138.9, -5.7, 13.2, 47.1]),
-    (46.2, 33.4, [0.3, 45.5, 45.9, 139.1, 137.5, 12.8, 137.6, 0.2, 99.9, 0.0, 0.1, 100.8, 92.9, -7.9, 8.2, 65.0]),
-    (46.8, 71.2, [0.2, 22.2, 22.6, 106.5, 115.0, 7.5, 107.2, 0.3, 73.3, 0.0, 0.1, 81.0, 79.0, -2.0, 3.9, 63.4]),
-    (40.5, 133.8, [0.3, 44.5, 44.9, 120.8, 116.1, 10.0, 118.2, 0.2, 78.0, 0.0, 0.1, 76.3, 71.9, -4.4, -19.5, 64.9]),
-    (62.2, -136.5, [0.7, 144.3, 144.3, 213.8, 178.6, 50.6, 168.9, 0.0, 95.8, 0.0, 0.0, 106.6, 111.4, 4.8, 10.0, 53.3]),
-    (67.0, 22.5, [0.5, 63.5, 64.6, 122.5, 122.6, 17.4, 110.2, 0.1, 77.7, 0.0, 0.1, 79.2, 64.7, -14.6, 14.6, 54.5]),
-]
-
-TOP_K = 3          # best-matching anchors kept
-CENTROID_W = 2     # centroid copies in the median (stabiliser)
-
-
-def haversine(lat1, lon1, lat2, lon2):
-    p1 = math.radians(lat1)
-    p2 = math.radians(lat2)
-    dp = p2 - p1
-    dl = math.radians(lon2 - lon1)
-    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
-    return 2 * 6371 * math.asin(min(1, math.sqrt(a)))
-
-
-def geometric_median(points):
-    """Weiszfeld iteration, deterministic: fixed start (mean) and 50 rounds."""
-    lat = sum(p[0] for p in points) / len(points)
-    lon = sum(p[1] for p in points) / len(points)
+def distance(a,b):
+    return math.sqrt(sum((((a[i]-MEANS[i])/SDS[i])-((b[i]-MEANS[i])/SDS[i]))**2 for i in range(len(FEATS))))
+def hav(a,b):
+    p1,p2=math.radians(a[0]),math.radians(b[0]); dp=p2-p1; dl=math.radians(b[1]-a[1])
+    z=math.sin(dp/2)**2+math.cos(p1)*math.cos(p2)*math.sin(dl/2)**2
+    return 12742*math.asin(min(1,math.sqrt(z)))
+def median_point(points):
+    lat=sum(p[0] for p in points)/len(points); lon=sum(p[1] for p in points)/len(points)
     for _ in range(50):
-        nla = nlo = den = 0.0
-        for (la, lo) in points:
-            d = haversine(lat, lon, la, lo)
-            if d < 1e-9:
-                return la, lo
-            w = 1.0 / d
-            nla += la * w
-            nlo += lo * w
-            den += w
-        nlat = nla / den
-        nlon = nlo / den
-        if abs(nlat - lat) < 1e-6 and abs(nlon - lon) < 1e-6:
-            break
-        lat, lon = nlat, nlon
-    return lat, lon
-
-
-def predict(feats):
-    """(lat, lon) for one photo's feature dict."""
-    scored = []
-    for (la, lo, prof) in ANCHORS:
-        s = 0.0
-        for i, f in enumerate(FEATS):
-            m, sd = STD[i]
-            s += (((feats[f] - m) / sd) - ((prof[i] - m) / sd)) ** 2
-        scored.append((math.sqrt(s), la, lo))
-    scored.sort(key=lambda t: t[0])
-    pts = [(la, lo) for (_, la, lo) in scored[:TOP_K]]
-    pts += [CENTROID] * CENTROID_W
-    lat, lon = geometric_median(pts)
-    lat = max(-90.0, min(90.0, lat))
-    lon = max(-180.0, min(180.0, lon))
-    return lat, lon
-
-
-def locate(jpeg_bytes):
-    """(lat, lon) for one photo's JPEG bytes; CENTROID when it cannot be read."""
-    try:
-        w, h, comps, grids = decode_dc(jpeg_bytes)
-        _, _, rgb = dc_to_rgb_grid(w, h, comps, grids)
-        return predict(extract(rgb))
-    except Exception:
-        return CENTROID
-
-
-# ---------------------------------------------------------------- env protocol
-_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-
-
-def _http(method, url, body=None):
-    req = urllib.request.Request(url, data=body, method=method,
-                                 headers={"Content-Type": "application/json",
-                                          "Accept": "application/json"})
-    try:
-        with _OPENER.open(req, timeout=120) as res:
-            return res.status, res.read()
-    except urllib.error.HTTPError as err:
-        try:
-            return err.code, err.read()
-        finally:
-            err.close()
-
-
+        nlat=nlon=den=0.0
+        for la,lo in points:
+            d=hav((lat,lon),(la,lo))
+            if d<1e-9: return la,lo
+            wt=1/d; nlat+=la*wt; nlon+=lo*wt; den+=wt
+        la,lo=nlat/den,nlon/den
+        if abs(la-lat)<1e-6 and abs(lo-lon)<1e-6: break
+        lat,lon=la,lo
+    return lat,lon
+def locate(data):
+    f=features(decode_jpeg(data)); ranked=sorted(ANCHORS,key=lambda a:distance(f,a[2]))
+    return median_point([(a[0],a[1]) for a in ranked[:3]]+[CENTROID])
+def request(url, body=None):
+    req=urllib.request.Request(url,data=body,headers={'Content-Type':'application/json'} if body is not None else {})
+    with urllib.request.urlopen(req,timeout=60) as response: return response.read()
 def main():
-    env_url = os.environ.get("MAKEFUN_ENV_URL", "").rstrip("/")
-    if not env_url:
-        raise SystemExit("MAKEFUN_ENV_URL is not set")
-    status, raw = _http("GET", env_url + "/photos")
-    if status != 200:
-        raise SystemExit("GET /photos failed: %d" % status)
-    photos = json.loads(raw.decode("utf-8"))["photos"]
-    answers = []
-    for photo in photos:
-        if photo.get("answered"):
-            continue
-        pid = photo["id"]
-        try:
-            _, data = _http("GET", env_url + "/photos/" + pid + ".jpg")
-            lat, lon = locate(data)
-        except Exception:
-            lat, lon = CENTROID
-        answers.append({"id": pid, "lat": round(lat, 6), "lon": round(lon, 6)})
-    if not answers:
-        return
-    body = json.dumps({"answers": answers}, separators=(",", ":")).encode("utf-8")
-    status, _ = _http("POST", env_url + "/answers", body)
-    if status != 200:
-        # Retry one by one so a single bad answer cannot sink the batch.
-        for a in answers:
-            b = json.dumps({"answers": [a]}, separators=(",", ":")).encode("utf-8")
-            _http("POST", env_url + "/answers", b)
-
-
-if __name__ == "__main__":
-    main()
+    base=os.environ['MAKEFUN_ENV_URL'].rstrip('/')
+    photos=json.loads(request(base+'/photos'))['photos']; answers=[]
+    for p in photos:
+        try: lat,lon=locate(request(base+p['url']))
+        except Exception: lat,lon=CENTROID
+        answers.append({'id':p['id'],'lat':round(lat,6),'lon':round(lon,6)})
+    request(base+'/answers',json.dumps({'answers':answers},separators=(',',':')).encode())
+if __name__=='__main__': main()
